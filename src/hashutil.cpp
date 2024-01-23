@@ -195,20 +195,105 @@ do_hash_file(const Context& ctx,
   (void)ctx;
 #endif
 
-  const auto data = util::read_file<std::string>(path, size_hint);
-  if (!data) {
-    LOG("Failed to read {}: {}", path, data.error());
-    return HashSourceCodeResult(HashSourceCode::error);
+  std::string_view file_data;
+  bool win32_hash_using_file_mapping_result = false;
+  void* win32_file_data_ptr = nullptr;
+#if _WIN32
+  win32_hash_using_file_mapping_result =
+    [&path, &file_data, &win32_file_data_ptr]() {
+      struct Win32HANDLEDeleter
+      {
+        using pointer = HANDLE;
+        void
+        operator()(pointer handle) const
+        {
+          CloseHandle(handle);
+        }
+      };
+      using win32_unique_handle =
+        std::unique_ptr<std::remove_pointer<HANDLE>, Win32HANDLEDeleter>;
+
+      auto wide_length =
+        MultiByteToWideChar(CP_UTF8, 0, path.data(), path.length(), nullptr, 0);
+      auto wide_string = std::make_unique<wchar_t[]>(wide_length + 1);
+      MultiByteToWideChar(
+        CP_UTF8, 0, path.data(), path.length(), wide_string.get(), wide_length);
+      wide_string[wide_length] = wchar_t(0);
+      auto file_handle_raw =
+        CreateFileW(wide_string.get(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                    nullptr);
+      if (file_handle_raw == INVALID_HANDLE_VALUE) {
+        LOG("Failed to open file: {}", path);
+        return false;
+      }
+      win32_unique_handle file_handle(file_handle_raw);
+
+      LARGE_INTEGER file_size;
+      if (!GetFileSizeEx(file_handle.get(), &file_size)) {
+        LOG("Failed to get size of file: {}", path);
+        return false;
+      }
+
+      if (file_size.QuadPart == 0) {
+        return true;
+      }
+
+      auto file_mapping_handle_raw = CreateFileMappingW(
+        file_handle.get(), nullptr, PAGE_READONLY, 0, 0, nullptr);
+      if (file_mapping_handle_raw == INVALID_HANDLE_VALUE
+          || !file_mapping_handle_raw) {
+        LOG("Failed to create file mapping for file {}", path);
+        return false;
+      }
+      win32_unique_handle file_mapping_handle(file_mapping_handle_raw);
+
+      win32_file_data_ptr =
+        MapViewOfFile(file_mapping_handle.get(), FILE_MAP_READ, 0, 0, 0);
+      if (!win32_file_data_ptr) {
+        LOG("Failed to map the file: {}", path);
+        return false;
+      }
+
+      file_data =
+        std::string_view{reinterpret_cast<const char*>(win32_file_data_ptr),
+                         size_t(file_size.QuadPart)};
+      return true;
+    }();
+
+  if (!win32_hash_using_file_mapping_result) {
+    LOG("Could not map file : {}. Falling back to slower fread...", path);
+  }
+#endif
+
+  tl::expected<std::string, std::string> read_file_result;
+  if (!win32_hash_using_file_mapping_result) {
+    read_file_result = util::read_file<std::string>(path, size_hint);
+    if (!read_file_result) {
+      LOG("Failed to read {}: {}", path, read_file_result.error());
+      return HashSourceCodeResult(HashSourceCode::error);
+    }
+    file_data = *read_file_result;
   }
 
   HashSourceCodeResult result;
   if (check_temporal_macros) {
-    result.insert(check_for_temporal_macros(*data));
+    result.insert(check_for_temporal_macros(file_data));
   }
 
   Hash hash;
-  hash.hash(*data);
+  hash.hash(file_data);
   digest = hash.digest();
+
+#if _WIN32
+  if (win32_file_data_ptr) {
+    UnmapViewOfFile(win32_file_data_ptr);
+  }
+#endif
 
 #ifdef INODE_CACHE_SUPPORTED
   ctx.inode_cache.put(path, content_type, digest, result);
